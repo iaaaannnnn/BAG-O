@@ -1,0 +1,2607 @@
+import 'package:flutter/material.dart';
+import 'dart:io';
+import 'dart:convert';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:rxdart/rxdart.dart';
+import 'package:file_picker/file_picker.dart';
+
+// Debug logger helper (stripped in production builds)
+void debugLog(String message) {
+  if (!kReleaseMode) {
+    // ignore: avoid_print
+    print(message);
+  }
+}
+
+const kReleaseMode = bool.fromEnvironment('dart.vm.product');
+
+// Global notifier to force UI rebuild on login/logout when authStateChanges() doesn't fire
+final ValueNotifier<int> authRefreshNotifier = ValueNotifier(0);
+
+// Helper function to format barangay address
+String formatBarangayAddress(Map<String, dynamic>? userData) {
+  if (userData == null) return 'Unknown Location';
+  final brgy = userData['barangay'] as String? ?? '';
+  final muni = userData['municipality'] as String? ?? '';
+  final prov = userData['province'] as String? ?? '';
+  
+  final parts = <String>[];
+  if (brgy.isNotEmpty) parts.add(brgy.startsWith('Brgy. ') || brgy.startsWith('Barangay ') ? brgy : 'Brgy. $brgy');
+  if (muni.isNotEmpty) parts.add(muni);
+  if (prov.isNotEmpty) parts.add(prov.length > 4 ? prov.substring(0, 3).toUpperCase() : prov);
+  
+  return parts.isEmpty ? 'Unknown Location' : parts.join(', ');
+}
+
+// Real data mode: always use live Firestore data
+const bool kUseMockData = false;
+
+// Empty mock placeholders (kept to avoid analyzer errors from leftover references)
+const List<Map<String, dynamic>> kMockPendingRequests = <Map<String, dynamic>>[];
+const List<Map<String, dynamic>> kMockResidents = <Map<String, dynamic>>[];
+const List<Map<String, dynamic>> kMockComplaints = <Map<String, dynamic>>[];
+const List<Map<String, dynamic>> kMockTransparencyDocs = <Map<String, dynamic>>[];
+
+// Limits and quotas
+const int maxTransparencyUploadBytes = 10 * 1024 * 1024; // 10 MB
+const int maxRequestsPerDocPerDay = 2; // per-document-type per user per day
+const int maxComplaintsPerDay = 2; // complaints per user per day
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  runApp(const BarangayApp());
+}
+
+// Firebase Auth Service
+class AuthService {
+  static final FirebaseAuth _auth = FirebaseAuth.instance;
+  static final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  static final FirebaseStorage _storage = FirebaseStorage.instance;
+
+  static User? get currentUser => _auth.currentUser;
+  static String? userType;
+  static Map<String, dynamic>? currentUserData;
+
+  static Future<bool> register(String email, String password, String type, Map<String, dynamic> userData) async {
+    UserCredential? userCredential;
+    try {
+      debugLog('Attempting to register: $email');
+
+      // Create user account (will throw if email already exists)
+      debugLog('Creating user account...');
+      userCredential = await _auth.createUserWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+
+      debugLog('User created with UID: ${userCredential.user!.uid}');
+      debugLog('Saving to Firestore...');
+      
+      try {
+        await _firestore.collection('users').doc(userCredential.user!.uid).set({
+          'type': type,
+          ...userData,
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+        debugLog('Firestore write successful!');
+      } catch (firestoreError) {
+        debugLog('Firestore write error: $firestoreError');
+        // Attempt to clean up the auth user since Firestore write failed
+        try {
+          await userCredential!.user!.delete();
+          debugLog('Rolled back created auth user due to Firestore error.');
+        } catch (delErr) {
+          debugLog('Failed to delete orphaned user: $delErr');
+        }
+        rethrow;
+      }
+
+      // Sign out the newly-created user so the app returns to the login flow.
+      // The UI expects the user to login after registration.
+      await _auth.signOut();
+
+      debugLog('Registration successful! New user signed out; please login.');
+      return true;
+    } on FirebaseAuthException catch (e) {
+      // Re-throw to allow UI to present specific messages
+      debugLog('FirebaseAuthException during register: ${e.code} - ${e.message}');
+      rethrow;
+    } catch (e) {
+      debugLog('Registration error (general): $e');
+      rethrow;
+    }
+  }
+
+  static Future<bool> login(String email, String password) async {
+    try {
+      // Reset userType before login to prevent stale data from previous session
+      userType = null;
+      
+      UserCredential userCredential = await _auth.signInWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+
+      DocumentSnapshot userDoc = await _firestore.collection('users').doc(userCredential.user!.uid).get();
+      currentUserData = userDoc.data() as Map<String, dynamic>?;
+      userType = currentUserData?['type'];
+      debugLog('Login successful. UID=${userCredential.user!.uid}, type=${userType}');
+      
+      // Force UI refresh by incrementing the notifier, since authStateChanges() may not emit a new event
+      await Future.delayed(const Duration(milliseconds: 100));
+      authRefreshNotifier.value++;
+      debugLog('[AUTH] ✓ Triggered authRefreshNotifier after login');
+      
+      return true;
+    } on FirebaseAuthException catch (e) {
+      debugLog('FirebaseAuthException during login: ${e.code} - ${e.message}');
+      rethrow;
+    } catch (e) {
+      debugLog('Login error: $e');
+      rethrow;
+    }
+  }
+
+  static Future<void> logout() async {
+    userType = null;
+    currentUserData = null;
+    await _auth.signOut();
+    // Trigger UI refresh after logout
+    await Future.delayed(const Duration(milliseconds: 100));
+    authRefreshNotifier.value++;
+    debugLog('[AUTH] ✓ Triggered authRefreshNotifier after logout');
+  }
+
+  static Future<Map<String, dynamic>?> getUserData() async {
+    if (currentUser == null) {
+      debugLog('[getUserData] currentUser is null');
+      return null;
+    }
+    
+    try {
+      debugLog('[getUserData] Fetching user data for ${currentUser!.uid}');
+      DocumentSnapshot doc = await _firestore.collection('users').doc(currentUser!.uid).get();
+      
+      if (doc.exists) {
+        debugLog('[getUserData] ✓ User document found');
+        return doc.data() as Map<String, dynamic>?;
+      } else {
+        debugLog('[getUserData] Document does not exist on first attempt, retrying after 300ms...');
+        // Retry after 300ms in case of eventual consistency
+        await Future.delayed(const Duration(milliseconds: 300));
+        DocumentSnapshot retryDoc = await _firestore.collection('users').doc(currentUser!.uid).get();
+        if (retryDoc.exists) {
+          debugLog('[getUserData] ✓ User document found on retry');
+          return retryDoc.data() as Map<String, dynamic>?;
+        } else {
+          debugLog('[getUserData] ⚠ Document still does not exist, trying once more after 700ms...');
+          // One more retry with longer delay
+          await Future.delayed(const Duration(milliseconds: 700));
+          DocumentSnapshot finalRetryDoc = await _firestore.collection('users').doc(currentUser!.uid).get();
+          if (finalRetryDoc.exists) {
+            debugLog('[getUserData] ✓ User document found on second retry');
+            return finalRetryDoc.data() as Map<String, dynamic>?;
+          } else {
+            debugLog('[getUserData] ✗ Document does not exist after 3 attempts');
+            return null;
+          }
+        }
+      }
+    } catch (e) {
+      debugLog('[getUserData] Error: $e');
+      return null;
+    }
+  }
+
+  static Future<void> updateUserData(Map<String, dynamic> data) async {
+    if (currentUser == null) return;
+    await _firestore.collection('users').doc(currentUser!.uid).update(data);
+  }
+
+  static Future<String?> uploadImage(File file, String path) async {
+    try {
+      final ref = _storage.ref().child(path);
+      await ref.putFile(file);
+      return await ref.getDownloadURL();
+    } catch (e) {
+      debugLog('Upload error: $e');
+      return null;
+    }
+  }
+}
+
+// Notification Service
+class NotificationService {
+  static final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  static Future<void> addNotification(String userId, String title, String message) async {
+    await _firestore.collection('notifications').add({
+      'userId': userId,
+      'title': title,
+      'message': message,
+      'timestamp': FieldValue.serverTimestamp(),
+      'read': false,
+    });
+  }
+
+  static Stream<QuerySnapshot> getNotifications(String userId) {
+    return _firestore
+        .collection('notifications')
+        .where('userId', isEqualTo: userId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+}
+
+class BarangayApp extends StatelessWidget {
+  const BarangayApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'BAGO - Barangay Automated Governance and Operation',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        primaryColor: const Color(0xFF228B22),
+        scaffoldBackgroundColor: Colors.grey[50],
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF228B22),
+          foregroundColor: Colors.white,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFF228B22),
+            foregroundColor: Colors.white,
+          ),
+        ),
+        floatingActionButtonTheme: const FloatingActionButtonThemeData(
+          backgroundColor: Color(0xFF228B22),
+        ),
+      ),
+      home: ValueListenableBuilder<int>(
+        valueListenable: authRefreshNotifier,
+        builder: (context, refreshCount, _) {
+          return StreamBuilder<User?>(
+            stream: FirebaseAuth.instance.authStateChanges(),
+            builder: (context, snapshot) {
+              debugLog('[AUTH] Auth state changed: hasData=${snapshot.hasData}, uid=${snapshot.data?.uid}, refreshCount=$refreshCount');
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Scaffold(body: Center(child: CircularProgressIndicator()));
+              }
+              if (snapshot.hasData && snapshot.data != null) {
+                // Use a key based on the user UID to force FutureBuilder to refresh on auth changes
+                final userId = snapshot.data!.uid;
+                return FutureBuilder<Map<String, dynamic>?>(
+                  key: ValueKey(userId),
+                  future: AuthService.getUserData().timeout(
+                    const Duration(seconds: 7),
+                    onTimeout: () {
+                      debugLog('[AUTH] getUserData() timed out after 7 seconds for user $userId');
+                      return null;
+                    },
+                  ),
+                  builder: (context, userSnapshot) {
+                    debugLog('[AUTH] FutureBuilder state: connectionState=${userSnapshot.connectionState}, hasData=${userSnapshot.hasData}');
+                    if (userSnapshot.connectionState == ConnectionState.waiting) {
+                      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+                    }
+                    if (userSnapshot.hasData && userSnapshot.data != null) {
+                        AuthService.userType = (userSnapshot.data!['type']);
+                        debugLog('[AUTH] ✓ Resolved userType from Firestore: ${AuthService.userType}');
+                        return AuthService.userType == 'Resident'
+                          ? const ResidentDashboard()
+                          : const OfficialDashboard();
+                }
+                debugLog('[AUTH] No user data found or timeout; returning to LoginPage');
+                return const LoginPage();
+                  },
+                );
+              }
+              debugLog('[AUTH] No authenticated user; showing LoginPage');
+              return const LoginPage();
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+// ==================== LOGIN PAGE ====================
+class LoginPage extends StatefulWidget {
+  const LoginPage({Key? key}) : super(key: key);
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _obscurePassword = true;
+  bool _isLoading = false;
+  bool _showForgotPassword = false;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _handleLogin() async {
+    if (_formKey.currentState!.validate()) {
+      if (mounted) setState(() => _isLoading = true);
+
+      try {
+        // Try to login directly; Firebase will report if email/password is invalid.
+        bool success = await AuthService.login(_emailController.text.trim(), _passwordController.text);
+
+        // If the widget was unmounted while waiting (e.g. navigation on auth change), exit.
+        if (!mounted) return;
+
+        setState(() => _isLoading = false);
+
+        if (success) {
+          // Login succeeded; the StreamBuilder in BarangayApp will handle navigation.
+          return;
+        }
+      } on FirebaseAuthException catch (e) {
+        setState(() => _isLoading = false);
+        String title;
+        String message;
+        String? actionText;
+        VoidCallback? actionCallback;
+
+        if (e.code == 'user-not-found') {
+          title = 'Account Not Found';
+          message = 'No account exists for this email address. Would you like to create a new account?';
+          actionText = 'Register';
+          actionCallback = () {
+            Navigator.pop(context);
+            Navigator.push(context, MaterialPageRoute(builder: (context) => const RegisterPage()));
+          };
+          setState(() => _showForgotPassword = true);
+        } else if (e.code == 'wrong-password') {
+          title = 'Incorrect Password';
+          message = 'The password you entered is incorrect. Please try again or reset your password.';
+          actionText = 'Reset Password';
+          actionCallback = () {
+            Navigator.pop(context);
+            _showForgotPasswordDialog();
+          };
+          setState(() => _showForgotPassword = true);
+        } else if (e.code == 'invalid-email') {
+          title = 'Invalid Email';
+          message = 'Please enter a valid email address.';
+        } else if (e.code == 'user-disabled') {
+          title = 'Account Disabled';
+          message = 'This account has been disabled. Please contact support.';
+        } else if (e.code == 'too-many-requests') {
+          title = 'Too Many Attempts';
+          message = 'You\'ve tried to login too many times. Please try again later.';
+        } else if (e.code == 'invalid-credential') {
+          title = 'Login Failed';
+          message = 'Invalid email or password. Please check and try again.';
+          setState(() => _showForgotPassword = true);
+        } else {
+          title = 'Login Error';
+          message = 'An error occurred: ${e.message}';
+        }
+
+        if (mounted) {
+          _showErrorDialog(title, message, actionText, actionCallback);
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() => _isLoading = false);
+          _showErrorDialog('Error', 'An unexpected error occurred: ${e.toString()}', null, null);
+        }
+      }
+    }
+  }
+
+  void _showErrorDialog(String title, String message, String? actionText, VoidCallback? actionCallback) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          if (actionText != null && actionCallback != null)
+            ElevatedButton(
+              onPressed: actionCallback,
+              child: Text(actionText),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showForgotPasswordDialog() {
+    final emailController = TextEditingController(text: _emailController.text.trim());
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Reset Password'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Enter your email address and we\'ll send you a password reset link.'),
+            const SizedBox(height: 16),
+            TextField(
+              controller: emailController,
+              keyboardType: TextInputType.emailAddress,
+              decoration: InputDecoration(
+                hintText: 'Enter your email',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              final email = emailController.text.trim();
+              if (email.isEmpty || !email.contains('@')) {
+                if (mounted) {
+                  Navigator.pop(context);
+                  _showErrorDialog('Invalid Email', 'Please enter a valid email address.', null, null);
+                }
+                return;
+              }
+              try {
+                await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
+                if (mounted) {
+                  Navigator.pop(context);
+                  showDialog(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('Email Sent'),
+                      content: const Text('A password reset link has been sent to your email. Please check your inbox.'),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('OK'),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+              } on FirebaseAuthException catch (e) {
+                if (mounted) {
+                  Navigator.pop(context);
+                  _showErrorDialog('Error', 'Could not send reset email: ${e.message}', null, null);
+                }
+              }
+            },
+            child: const Text('Send'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24.0),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                children: [
+                  SizedBox(
+                    width: 220,
+                    height: 220,
+                    child: Image.asset(
+                      'assets/images/FINAL_LOGO_NAT_-removebg-preview.png',
+                      fit: BoxFit.contain,
+                      errorBuilder: (context, error, stackTrace) {
+                        return Container(
+                          color: const Color(0xFF228B22),
+                          child: const Icon(Icons.location_city, size: 140, color: Colors.white),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text('BAGO', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Color(0xFF228B22))),
+                  const Text('Barangay Automated Governance and Operation', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 30),
+
+                  TextFormField(
+                    controller: _emailController,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: InputDecoration(
+                      labelText: 'Email',
+                      prefixIcon: const Icon(Icons.email),
+                      filled: true,
+                      fillColor: Colors.white,
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: Colors.grey[300]),
+                      ),
+                    ),
+                    validator: (val) => val!.isEmpty || !val.contains('@') ? 'Enter valid email' : null,
+                  ),
+                  const SizedBox(height: 16),
+
+                  TextFormField(
+                    controller: _passwordController,
+                    obscureText: _obscurePassword,
+                    decoration: InputDecoration(
+                      labelText: 'Password',
+                      prefixIcon: const Icon(Icons.lock),
+                      filled: true,
+                      fillColor: Colors.white,
+                      suffixIcon: IconButton(
+                        icon: Icon(_obscurePassword ? Icons.visibility_off : Icons.visibility),
+                        onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                      ),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: Colors.grey[300]),
+                      ),
+                    ),
+                    validator: (val) => val!.isEmpty ? 'Enter password' : null,
+                  ),
+                  const SizedBox(height: 20),
+
+                  _isLoading
+                      ? const CircularProgressIndicator()
+                      : ElevatedButton(
+                    onPressed: _handleLogin,
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 60),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: const Text('LOGIN', style: TextStyle(fontSize: 15)),
+                  ),
+                  const SizedBox(height: 12),
+
+                  Column(
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const RegisterPage())),
+                        child: const Text("Don't have an account? Register", style: TextStyle(color: Color(0xFF228B22))),
+                      ),
+                      if (_showForgotPassword)
+                        TextButton(
+                          onPressed: _showForgotPasswordDialog,
+                          child: const Text('Forgot Password?', style: TextStyle(color: Color(0xFF228B22))),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== REGISTRATION PAGE ====================
+class RegisterPage extends StatefulWidget {
+  const RegisterPage({Key? key}) : super(key: key);
+
+  @override
+  State<RegisterPage> createState() => _RegisterPageState();
+}
+
+class _RegisterPageState extends State<RegisterPage> {
+  final _formKey = GlobalKey<FormState>();
+  final _firstNameController = TextEditingController();
+  final _lastNameController = TextEditingController();
+  final _middleNameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _mobileController = TextEditingController();
+  final _passwordController = TextEditingController();
+  final _confirmPasswordController = TextEditingController();
+  final _addressController = TextEditingController();
+  // Region 8 (Eastern Visayas) province -> municipality -> barangay mapping (loaded from asset)
+  Map<String, Map<String, List<String>>> _region8Provinces = {};
+  List<String> _provinces = [];
+  List<String> _municipalities = [];
+  List<String> _barangays = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRegion8FromAsset();
+  }
+
+  Future<void> _loadRegion8FromAsset() async {
+    try {
+      // Load index.json which lists available province files (per-province assets)
+      final indexStr = await rootBundle.loadString('assets/data/region8/index.json');
+      final List<dynamic> indexList = json.decode(indexStr) as List<dynamic>;
+      final List<String> provinces = indexList.map((e) => e.toString()).toList()..sort();
+
+      // Initialize province list; municipalities/barangays are lazy-loaded on selection
+      if (mounted) {
+        setState(() {
+          _provinces = provinces;
+          _region8Provinces = {}; // will be populated per-province as needed
+        });
+      } else {
+        _provinces = provinces;
+        _region8Provinces = {};
+      }
+      debugLog('[REGION8] ✓ Loaded region8 index with ${_provinces.length} provinces: $_provinces');
+    } catch (e) {
+      debugLog('[REGION8] ✗ ERROR loading region8 asset: $e');
+      if (mounted) {
+        setState(() {
+          _region8Provinces = {};
+          _provinces = [];
+        });
+      } else {
+        _region8Provinces = {};
+        _provinces = [];
+      }
+    }
+  }
+
+  // Lazy-load a single province file into _region8Provinces if not already present.
+  Future<void> _ensureProvinceLoaded(String province) async {
+    if (_region8Provinces.containsKey(province)) return;
+    try {
+      // Build a list of filename candidates to try (without extension)
+      final sanitized = province.replaceAll(RegExp(r"[^A-Za-z0-9 \-_()]"), '');
+      final candidates = <String>{
+        province,
+        province.replaceAll(' ', '%20'),
+        province.replaceAll(' ', '_'),
+        province.replaceAll(' ', '-'),
+        province.toLowerCase(),
+        province.toLowerCase().replaceAll(' ', '_'),
+        sanitized,
+        sanitized.replaceAll(' ', '_'),
+        sanitized.replaceAll(' ', '-'),
+      };
+
+      String? jsonStr;
+      String? usedCandidate;
+      for (final cand in candidates) {
+        final path = 'assets/data/region8/$cand.json';
+        try {
+          jsonStr = await rootBundle.loadString(path);
+          usedCandidate = cand;
+          break;
+        } catch (_) {
+          // continue trying other candidates
+        }
+      }
+
+      if (jsonStr == null) {
+        // As a last resort, try the raw province with original spacing (again) to produce clearer error
+        try {
+          jsonStr = await rootBundle.loadString('assets/data/region8/$province.json');
+          usedCandidate = province;
+        } catch (e) {
+          throw Exception('Could not find asset for province "$province". Tried ${candidates.length} variants.');
+        }
+      }
+
+      final Map<String, dynamic> parsed = json.decode(jsonStr) as Map<String, dynamic>;
+      Map<String, List<String>> muniMap = {};
+      if (parsed.containsKey(province) && parsed[province] is Map) {
+        final Map<String, dynamic> raw = parsed[province] as Map<String, dynamic>;
+        raw.forEach((k, v) {
+          muniMap[k] = List<String>.from(v as List);
+        });
+      } else {
+        parsed.forEach((k, v) {
+          muniMap[k] = List<String>.from(v as List);
+        });
+      }
+
+      if (mounted) {
+        setState(() {
+          _region8Provinces[province] = muniMap;
+        });
+      } else {
+        _region8Provinces[province] = muniMap;
+      }
+      debugLog('[REGION8] ✓ Loaded province asset for $province (${muniMap.length} municipalities) via "$usedCandidate.json"');
+    } catch (e) {
+      debugLog('[REGION8] ✗ ERROR loading province asset for $province: $e');
+      if (mounted) {
+        setState(() {
+          _region8Provinces[province] = {};
+        });
+      } else {
+        _region8Provinces[province] = {};
+      }
+    }
+  }
+
+  String? _selectedProvince;
+  String? _selectedMunicipality;
+  String? _selectedBarangay;
+  String _userType = 'Resident';
+  String _suffix = 'None';
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
+  bool _isLoading = false;
+
+  Future<void> _handleRegister() async {
+    if (_formKey.currentState!.validate()) {
+      if (_passwordController.text != _confirmPasswordController.text) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Passwords do not match!')));
+        return;
+      }
+
+      setState(() => _isLoading = true);
+
+      String fullName = '${_firstNameController.text} ';
+      if (_middleNameController.text.isNotEmpty) {
+        fullName += '${_middleNameController.text} ';
+      }
+      fullName += _lastNameController.text;
+      if (_suffix != 'None') {
+        fullName += ' $_suffix';
+      }
+
+      try {
+        bool success = await AuthService.register(
+          _emailController.text.trim(),
+          _passwordController.text,
+          _userType,
+          {
+            'name': fullName,
+            'firstName': _firstNameController.text,
+            'lastName': _lastNameController.text,
+            'middleName': _middleNameController.text,
+            'suffix': _suffix,
+            'mobile': _mobileController.text,
+            'email': _emailController.text.trim(),
+            'address': _addressController.text,
+            'municipality': _selectedMunicipality ?? '',
+            'barangay': _selectedBarangay ?? '',
+          },
+        );
+
+        setState(() => _isLoading = false);
+
+        if (success && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Registration Successful! Please login.')));
+          Navigator.pop(context);
+        }
+      } on FirebaseAuthException catch (e) {
+        setState(() => _isLoading = false);
+        String message;
+        if (e.code == 'email-already-in-use') {
+          message = 'That email is already registered.';
+        } else if (e.code == 'weak-password') {
+          message = 'Password is too weak. Choose a stronger password.';
+        } else if (e.code == 'invalid-email') {
+          message = 'Invalid email format.';
+        } else {
+          message = 'Registration error: ${e.message}';
+        }
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      } catch (e) {
+        setState(() => _isLoading = false);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Error: ${e.toString()}')),
+          );
+        }
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Register')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Register As', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: Colors.grey[300]),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _userType,
+                    isExpanded: true,
+                    items: ['Resident', 'Barangay Official'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+                    onChanged: (val) => setState(() => _userType = val!),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+
+              TextFormField(
+                controller: _firstNameController,
+                decoration: InputDecoration(
+                  labelText: 'First Name',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                ),
+                validator: (val) => val!.isEmpty ? 'Required' : null,
+              ),
+              const SizedBox(height: 16),
+
+              TextFormField(
+                controller: _lastNameController,
+                decoration: InputDecoration(
+                  labelText: 'Last Name',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                ),
+                validator: (val) => val!.isEmpty ? 'Required' : null,
+              ),
+              const SizedBox(height: 16),
+
+              TextFormField(
+                controller: _middleNameController,
+                decoration: InputDecoration(
+                  labelText: 'Middle Name (Optional)',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              const Text('Suffix', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: Colors.grey[300]),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _suffix,
+                    isExpanded: true,
+                    items: ['None', 'Jr.', 'Sr.', 'II', 'III', 'IV', 'V'].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+                    onChanged: (val) => setState(() => _suffix = val!),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+
+              TextFormField(
+                controller: _emailController,
+                keyboardType: TextInputType.emailAddress,
+                decoration: InputDecoration(
+                  labelText: 'Email',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                ),
+                validator: (val) => val!.isEmpty || !val.contains('@') ? 'Enter valid email' : null,
+              ),
+              const SizedBox(height: 16),
+
+              TextFormField(
+                controller: _mobileController,
+                keyboardType: TextInputType.phone,
+                decoration: InputDecoration(
+                  labelText: 'Mobile Number',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                ),
+                validator: (val) {
+                  if (val!.isEmpty) return 'Required';
+                  if (val.length != 11) return 'Must be 11 digits';
+                  return null;
+                },
+              ),
+              const SizedBox(height: 16),
+
+              // Province selector (Region 8)
+              const Text('Province', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: Colors.grey[300]),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: (_provinces.isNotEmpty && _selectedProvince != null && _provinces.contains(_selectedProvince)) ? _selectedProvince : null,
+                    isExpanded: true,
+                    hint: const Text('Select Province'),
+                    items: _provinces.isEmpty
+                        ? [const DropdownMenuItem<String>(value: null, child: Text('Loading provinces...'))]
+                        : _provinces.map((p) => DropdownMenuItem<String>(value: p, child: Text(p))).toList(),
+                    onChanged: _provinces.isEmpty
+                        ? null
+                        : (val) async {
+                      debugLog('[REGION8] Province selected: $val');
+                      debugLog('[REGION8] Available provinces: $_provinces');
+                      // ensure the province data is loaded from assets
+                      if (val != null) await _ensureProvinceLoaded(val);
+                      if (!mounted) return;
+                      setState(() {
+                        _selectedProvince = val;
+                        _selectedMunicipality = null;
+                        _selectedBarangay = null;
+                        if (val != null) {
+                          final munis = _region8Provinces[val];
+                          debugLog('[REGION8] Region8Provinces keys: ${_region8Provinces.keys}');
+                          debugLog('[REGION8] Data for $val: $munis');
+                          _municipalities = (munis?.keys.toList() ?? [])..sort();
+                          debugLog('[REGION8] Municipalities for $val: ${_municipalities.toString()}');
+                        } else {
+                          _municipalities = [];
+                        }
+                        _barangays = [];
+                        _addressController.clear();
+                      });
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Municipality selector (Region 8)
+              const Text('Municipality / City', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: Colors.grey[300]),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: (_municipalities.isNotEmpty && _selectedMunicipality != null && _municipalities.contains(_selectedMunicipality)) ? _selectedMunicipality : null,
+                    isExpanded: true,
+                    hint: const Text('Select Municipality / City'),
+                    items: _municipalities.isEmpty
+                        ? [const DropdownMenuItem<String>(value: null, child: Text('Select a province first'))]
+                        : _municipalities.map((m) => DropdownMenuItem<String>(value: m, child: Text(m))).toList(),
+                    onChanged: _municipalities.isEmpty ? null : (val) {
+                      debugLog('[REGION8] Municipality selected: $val');
+                      setState(() {
+                        _selectedMunicipality = val;
+                        _selectedBarangay = null;
+                        if (val != null && _selectedProvince != null) {
+                          final barangays = _region8Provinces[_selectedProvince]?[val];
+                          debugLog('[REGION8] Barangays for $val: $barangays');
+                          _barangays = (barangays ?? [])..sort();
+                          _addressController.clear();
+                        }
+                      });
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              const Text('Barangay', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: Colors.grey[300]),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: (_barangays.isNotEmpty && _selectedBarangay != null && _barangays.contains(_selectedBarangay)) ? _selectedBarangay : null,
+                    isExpanded: true,
+                    hint: const Text('Select Barangay'),
+                    items: _barangays.isEmpty
+                        ? [const DropdownMenuItem<String>(value: null, child: Text('Select a municipality first'))]
+                        : _barangays.map((b) => DropdownMenuItem<String>(value: b, child: Text(b))).toList(),
+                    onChanged: _barangays.isEmpty ? null : (val) {
+                      debugLog('[REGION8] Barangay selected: $val');
+                      setState(() {
+                        _selectedBarangay = val;
+                        if (val != null && _selectedMunicipality != null && _selectedProvince != null) {
+                          _addressController.text = '$val, $_selectedMunicipality, $_selectedProvince';
+                          debugLog('[REGION8] Address set to: ${_addressController.text}');
+                        }
+                      });
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              TextFormField(
+                controller: _addressController,
+                decoration: InputDecoration(
+                  labelText: 'Full Address (auto-filled from selections)',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                ),
+                maxLines: 2,
+                readOnly: true,
+                validator: (val) => val!.isEmpty ? 'Required' : null,
+              ),
+              const SizedBox(height: 16),
+
+              TextFormField(
+                controller: _passwordController,
+                obscureText: _obscurePassword,
+                decoration: InputDecoration(
+                  labelText: 'Password',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscurePassword ? Icons.visibility_off : Icons.visibility),
+                    onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                  ),
+                ),
+                validator: (val) => val!.length < 6 ? 'Min 6 characters' : null,
+              ),
+              const SizedBox(height: 16),
+
+              TextFormField(
+                controller: _confirmPasswordController,
+                obscureText: _obscureConfirmPassword,
+                decoration: InputDecoration(
+                  labelText: 'Confirm Password',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey[300])),
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscureConfirmPassword ? Icons.visibility_off : Icons.visibility),
+                    onPressed: () => setState(() => _obscureConfirmPassword = !_obscureConfirmPassword),
+                  ),
+                ),
+                validator: (val) => val!.isEmpty ? 'Required' : null,
+              ),
+              const SizedBox(height: 24),
+
+              Center(
+                child: _isLoading
+                    ? const CircularProgressIndicator()
+                    : ElevatedButton(
+                  onPressed: _handleRegister,
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 60),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  child: const Text('REGISTER', style: TextStyle(fontSize: 15)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== RESIDENT DASHBOARD ====================
+class ResidentDashboard extends StatelessWidget {
+  const ResidentDashboard({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Map<String, dynamic>?>(
+      future: AuthService.getUserData(),
+      builder: (context, userSnapshot) {
+        final userData = userSnapshot.data;
+        final barangayAddr = formatBarangayAddress(userData);
+        
+        return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            const Icon(Icons.home, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '$barangayAddr — Resident Dashboard',
+                style: const TextStyle(color: Colors.white),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          StreamBuilder<QuerySnapshot>(
+            stream: NotificationService.getNotifications(AuthService.currentUser!.uid),
+            builder: (context, snapshot) {
+              int count = snapshot.hasData ? snapshot.data!.docs.length : 0;
+              return IconButton(
+                icon: Stack(
+                  children: [
+                    const Icon(Icons.notifications),
+                    if (count > 0)
+                      Positioned(
+                        right: 0,
+                        child: Container(
+                          padding: const EdgeInsets.all(2),
+                          decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                          constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                          child: Text('$count', style: const TextStyle(fontSize: 10, color: Colors.white), textAlign: TextAlign.center),
+                        ),
+                      ),
+                  ],
+                ),
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const NotificationsPage())),
+              );
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.logout),
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Logout'),
+                  content: const Text('Are you sure you want to logout?'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Cancel'),
+                    ),
+                    ElevatedButton(
+                      onPressed: () async {
+                        Navigator.pop(context);
+                        AuthService.userType = null;
+                        await AuthService.logout();
+                      },
+                      child: const Text('Logout'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Barangay location header
+          Container(
+            padding: const EdgeInsets.all(12),
+            color: Colors.grey[100],
+            child: Row(
+              children: [
+                const Icon(Icons.home, color: Color(0xFF228B22), size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    barangayAddr,
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFF228B22)),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: const Color(0xFF228B22),
+            child: Row(
+              children: [
+                Image.asset('assets/images/FINAL_LOGO_NAT_-removebg-preview.png', width: 56, height: 56, fit: BoxFit.contain),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('BAGO', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+                      SizedBox(height: 4),
+                      Text('Barangay Automated Governance and Operation', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: GridView.count(
+                crossAxisCount: 2,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+                childAspectRatio: 1.1,
+                children: [
+                  _buildDashboardCard(context, 'Request\nDocuments', Icons.description, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const RequestDocumentsPage()))),
+                  _buildDashboardCard(context, 'Announcements', Icons.campaign, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const AnnouncementsPage()))),
+                  _buildDashboardCard(context, 'File\nComplaint', Icons.report_problem, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const FileComplaintPage()))),
+                  _buildDashboardCard(context, 'My Profile', Icons.person, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ProfilePage()))),
+                  _buildDashboardCard(context, 'Emergency\nContacts', Icons.emergency, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const EmergencyContactsPage()))),
+                  _buildDashboardCard(context, 'Transparency', Icons.article, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const TransparencyPage()))),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+      }
+    );
+  }
+
+  Widget _buildDashboardCard(BuildContext context, String title, IconData icon, VoidCallback onTap) {
+    return Card(
+      elevation: 3,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 40, color: const Color(0xFF228B22)),
+              const SizedBox(height: 8),
+              Text(title, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== BARANGAY OFFICIAL DASHBOARD ====================
+class OfficialDashboard extends StatelessWidget {
+  const OfficialDashboard({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Map<String, dynamic>?>(
+      future: AuthService.getUserData(),
+      builder: (context, userSnapshot) {
+        final userData = userSnapshot.data;
+        final barangayAddr = formatBarangayAddress(userData);
+        final officialBarangay = userData?['barangay'] as String? ?? '';
+        
+        return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            const Icon(Icons.home, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '$barangayAddr — Official Dashboard',
+                style: const TextStyle(color: Colors.white),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Logout'),
+                  content: const Text('Are you sure you want to logout?'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Cancel'),
+                    ),
+                    ElevatedButton(
+                      onPressed: () async {
+                        Navigator.pop(context);
+                        AuthService.userType = null;
+                        await AuthService.logout();
+                      },
+                      child: const Text('Logout'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Barangay location header
+          Container(
+            padding: const EdgeInsets.all(12),
+            color: Colors.grey[100],
+            child: Row(
+              children: [
+                const Icon(Icons.home, color: Color(0xFF228B22), size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    barangayAddr,
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFF228B22)),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Statistics bar showing resident count
+          if (officialBarangay.isNotEmpty)
+            StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .where('barangay', isEqualTo: officialBarangay)
+                  .where('type', isEqualTo: 'Resident')
+                  .snapshots(),
+              builder: (context, snapshot) {
+                int residentCount = snapshot.hasData ? snapshot.data!.docs.length : 0;
+                return Container(
+                  padding: const EdgeInsets.all(16),
+                  color: const Color(0xFF228B22).withOpacity(0.1),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      Column(
+                        children: [
+                          const Icon(Icons.person, color: Color(0xFF228B22), size: 28),
+                          const SizedBox(height: 4),
+                          Text('$residentCount', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF228B22))),
+                          const Text('Residents', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: const Color(0xFF228B22),
+            child: const Row(
+              children: [
+                Icon(Icons.location_city, size: 40, color: Colors.white),
+                SizedBox(width: 12),
+                Expanded(child: Text('Region 8 System', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white))),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: GridView.count(
+                crossAxisCount: 2,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+                childAspectRatio: 1.1,
+                children: [
+                  _buildDashboardCard(context, 'Pending\nRequests', Icons.pending_actions, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const PendingRequestsPage()))),
+                  _buildDashboardCard(context, 'Residents\nDirectory', Icons.people, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ResidentsDirectoryPage()))),
+                  _buildDashboardCard(context, 'Post\nAnnouncement', Icons.announcement, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const PostAnnouncementPage()))),
+                  _buildDashboardCard(context, 'View\nComplaints', Icons.flag, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const ViewComplaintsAdminPage()))),
+                  _buildDashboardCard(context, 'Statistics', Icons.bar_chart, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const StatisticsPage()))),
+                  _buildDashboardCard(context, 'Transparency\nDocs', Icons.article, () => Navigator.push(context, MaterialPageRoute(builder: (context) => const TransparencyPage()))),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+      }
+    );
+  }
+
+  Widget _buildDashboardCard(BuildContext context, String title, IconData icon, VoidCallback onTap) {
+    return Card(
+      elevation: 3,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 40, color: const Color(0xFF228B22)),
+              const SizedBox(height: 8),
+              Text(title, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// SIMPLIFIED PLACEHOLDER PAGES
+class NotificationsPage extends StatelessWidget {
+  const NotificationsPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Notifications')),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: NotificationService.getNotifications(AuthService.currentUser!.uid),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+            return const Center(child: Text('No notifications'));
+          }
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: snapshot.data!.docs.length,
+            itemBuilder: (context, index) {
+              var notif = snapshot.data!.docs[index];
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: ListTile(
+                  leading: const Icon(Icons.notifications_active, color: Color(0xFF228B22)),
+                  title: Text(notif['title']),
+                  subtitle: Text(notif['message']),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class RequestDocumentsPage extends StatelessWidget {
+  const RequestDocumentsPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final documents = ['Barangay Clearance', 'Certificate of Indigency', 'Certificate of Residency', 'Business Permit', 'Barangay ID'];
+    return Scaffold(
+      appBar: AppBar(title: const Text('Request Documents')),
+      body: ListView.builder(
+        padding: const EdgeInsets.all(16),
+        itemCount: documents.length,
+        itemBuilder: (context, index) {
+          return Card(
+            margin: const EdgeInsets.only(bottom: 12),
+            child: ListTile(
+              leading: const Icon(Icons.description, color: Color(0xFF228B22)),
+              title: Text(documents[index]),
+              trailing: ElevatedButton(
+                onPressed: () async {
+                  try {
+                    // Ask for reason before submitting
+                    String? reason = await showDialog<String>(
+                      context: context,
+                      builder: (context) {
+                        final _reasonController = TextEditingController();
+                        return AlertDialog(
+                          title: const Text('Reason for request'),
+                          content: TextField(
+                            controller: _reasonController,
+                            decoration: const InputDecoration(hintText: 'Enter reason'),
+                            maxLines: 3,
+                          ),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+                            ElevatedButton(onPressed: () => Navigator.pop(context, _reasonController.text.trim()), child: const Text('Submit')),
+                          ],
+                        );
+                      },
+                    );
+
+                    if (reason == null || reason.isEmpty) {
+                      if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request cancelled (reason required)')));
+                      return;
+                    }
+
+                    // Get user's barangay for filtering
+                    final uid = AuthService.currentUser!.uid;
+                    final userData = await AuthService.getUserData();
+                    final userBarangay = userData?['barangay'] as String? ?? '';
+
+                    // Enforce per-document per-day limit
+                    final now = DateTime.now();
+                    final startOfDay = DateTime(now.year, now.month, now.day);
+                    try {
+                      final q = await FirebaseFirestore.instance.collection('requests')
+                        .where('userId', isEqualTo: uid)
+                        .where('subject', isEqualTo: documents[index])
+                        .where('timestamp', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfDay))
+                        .get();
+                      if (q.docs.length >= MAX_REQUESTS_PER_DOC_PER_DAY) {
+                        if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('You have reached the daily limit for ${documents[index]} ($MAX_REQUESTS_PER_DOC_PER_DAY).')));
+                        return;
+                      }
+                    } catch (quotaError) {
+                      debugLog('[Request] Warning: Could not check daily quota: $quotaError. Proceeding with submission.');
+                    }
+
+                    // Save request to Firestore - try user subcollection first, then top-level collection
+                    try {
+                      debugLog('[Request] Attempting to save request to users/$uid/requests...');
+                      await FirebaseFirestore.instance.collection('users').doc(uid).collection('requests').add({
+                        'subject': documents[index],
+                        'reason': reason,
+                        'status': 'Pending',
+                        'approval': 'Pending', // Track approval status separately
+                        'barangay': userBarangay, // Store barangay for filtering
+                        'timestamp': FieldValue.serverTimestamp(),
+                      });
+                      debugLog('[Request] ✓ Saved to user subcollection');
+                    } catch (subcollectionError) {
+                      debugLog('[Request] Subcollection write failed: $subcollectionError. Trying top-level requests collection...');
+                      // Fallback to top-level collection
+                      await FirebaseFirestore.instance.collection('requests').add({
+                        'userId': uid,
+                        'subject': documents[index],
+                        'reason': reason,
+                        'status': 'Pending',
+                        'approval': 'Pending',
+                        'barangay': userBarangay,
+                        'timestamp': FieldValue.serverTimestamp(),
+                      });
+                      debugLog('[Request] ✓ Saved to top-level collection');
+                    }
+
+                    try {
+                      await NotificationService.addNotification(
+                        uid,
+                        'Request Submitted',
+                        'Your ${documents[index]} request has been submitted',
+                      );
+                    } catch (notifError) {
+                      debugLog('[Request] Warning: Failed to add notification: $notifError');
+                      // Continue anyway - don't fail the whole request
+                    }
+
+                    if (context.mounted) {
+                      showDialog(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: const Text('✓ Request Submitted'),
+                          content: Text('Your ${documents[index]} request has been successfully submitted. Officials will review it soon.'),
+                          actions: [
+                            ElevatedButton(
+                              onPressed: () => Navigator.pop(context),
+                              child: const Text('OK'),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+                  } catch (e) {
+                    debugLog('Error submitting request: $e');
+                    if (context.mounted) {
+                      showDialog(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: const Text('Error'),
+                          content: Text('Failed to submit request: ${e.toString()}'),
+                          actions: [
+                            ElevatedButton(
+                              onPressed: () => Navigator.pop(context),
+                              child: const Text('OK'),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+                  }
+                },
+                child: const Text('Request'),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class AnnouncementsPage extends StatelessWidget {
+  const AnnouncementsPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Announcements')),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+          .collection('announcements')
+          .where('barangay', isEqualTo: AuthService.currentUserData?['barangay'] as String? ?? '')
+          .orderBy('timestamp', descending: true)
+          .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+          if (snapshot.hasError) {
+            debugLog('Error loading announcements: ${snapshot.error}');
+            return Center(child: Text('Error: ${snapshot.error.toString().replaceFirst('Exception: ', '')}'));
+          }
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const Center(child: Text('No announcements yet'));
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: snapshot.data!.docs.length,
+            itemBuilder: (context, index) {
+              var announcement = snapshot.data!.docs[index];
+              return Card(
+                margin: const EdgeInsets.only(bottom: 16),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(announcement['title'], style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 8),
+                      if ((announcement.data() as Map<String, dynamic>?)?.containsKey('imageUrl') == true && (announcement['imageUrl'] as String?) != null)
+                        Column(
+                          children: [
+                            Image.network(announcement['imageUrl'], fit: BoxFit.cover),
+                            const SizedBox(height: 8),
+                          ],
+                        ),
+                      Text(announcement['content']),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class FileComplaintPage extends StatefulWidget {
+  const FileComplaintPage({Key? key}) : super(key: key);
+
+  @override
+  State<FileComplaintPage> createState() => _FileComplaintPageState();
+}
+
+class _FileComplaintPageState extends State<FileComplaintPage> {
+  final _subjectController = TextEditingController();
+  final _descriptionController = TextEditingController();
+  File? _selectedImage;
+  final ImagePicker _picker = ImagePicker();
+  bool _isLoading = false;
+
+  Future<void> _pickImage() async {
+    final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
+    if (image != null) {
+      setState(() => _selectedImage = File(image.path));
+    }
+  }
+
+  Future<void> _submitComplaint() async {
+    if (_subjectController.text.isEmpty || _descriptionController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please fill all fields')));
+      return;
+    }
+
+    // Enforce per-day complaint limit
+    try {
+      final uid = AuthService.currentUser!.uid;
+      final now = DateTime.now();
+      final startOfDay = DateTime(now.year, now.month, now.day);
+      final recent = await FirebaseFirestore.instance.collection('complaints')
+        .where('userId', isEqualTo: uid)
+        .where('timestamp', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfDay))
+        .get();
+      if (recent.docs.length >= MAX_COMPLAINTS_PER_DAY) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('You have reached the daily complaint limit ($MAX_COMPLAINTS_PER_DAY).')));
+        return;
+      }
+    } catch (e) {
+      debugLog('Error checking complaint quota: $e');
+    }
+
+    setState(() => _isLoading = true);
+
+    String? imageUrl;
+    if (_selectedImage != null) {
+      try {
+        final len = await _selectedImage!.length();
+        if (len > MAX_TRANSPARENCY_UPLOAD_BYTES) {
+          setState(() => _isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Selected image is too large. Max ${MAX_TRANSPARENCY_UPLOAD_BYTES ~/ (1024*1024)} MB.')));
+          return;
+        }
+        imageUrl = await AuthService.uploadImage(_selectedImage!, 'complaints/${DateTime.now().millisecondsSinceEpoch}.jpg');
+      } catch (e) {
+        debugLog('Error uploading complaint image: $e');
+      }
+    }
+
+    await FirebaseFirestore.instance.collection('complaints').add({
+      'userId': AuthService.currentUser!.uid,
+      'subject': _subjectController.text,
+      'description': _descriptionController.text,
+      'imageUrl': imageUrl,
+      'status': 'Pending',
+      'barangay': AuthService.currentUserData?['barangay'] as String? ?? '',
+      'timestamp': FieldValue.serverTimestamp(),
+    });
+
+    await NotificationService.addNotification(
+      AuthService.currentUser!.uid,
+      'Complaint Received',
+      'Your complaint has been submitted and is being reviewed',
+    );
+
+    setState(() => _isLoading = false);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Complaint submitted successfully!')));
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('File a Complaint')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          children: [
+            TextFormField(
+              controller: _subjectController,
+              decoration: const InputDecoration(labelText: 'Subject', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 16),
+            TextFormField(
+              controller: _descriptionController,
+              decoration: const InputDecoration(labelText: 'Description', border: OutlineInputBorder()),
+              maxLines: 5,
+            ),
+            const SizedBox(height: 16),
+            if (_selectedImage != null)
+              Container(
+                height: 200,
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Image.file(_selectedImage!, fit: BoxFit.cover),
+              ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: _pickImage,
+              icon: const Icon(Icons.camera_alt),
+              label: Text(_selectedImage == null ? 'Add Photo Evidence' : 'Change Photo'),
+            ),
+            const SizedBox(height: 24),
+            _isLoading
+                ? const CircularProgressIndicator()
+                : ElevatedButton(
+              onPressed: _submitComplaint,
+              style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 60)),
+              child: const Text('SUBMIT'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ProfilePage extends StatefulWidget {
+  const ProfilePage({Key? key}) : super(key: key);
+
+  @override
+  State<ProfilePage> createState() => _ProfilePageState();
+}
+
+class _ProfilePageState extends State<ProfilePage> {
+  File? _profileImage;
+  final ImagePicker _picker = ImagePicker();
+  bool _isLoading = false;
+
+  Future<void> _pickImage() async {
+    final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
+    if (image != null) {
+      setState(() {
+        _profileImage = File(image.path);
+        _isLoading = true;
+      });
+
+      String? imageUrl = await AuthService.uploadImage(_profileImage!, 'profiles/${AuthService.currentUser!.uid}.jpg');
+      if (imageUrl != null) {
+        await AuthService.updateUserData({'profileImage': imageUrl});
+      }
+
+      setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('My Profile')),
+      body: FutureBuilder<Map<String, dynamic>?>(
+        future: AuthService.getUserData(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+
+          final userData = snapshot.data!;
+
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              children: [
+                Stack(
+                  children: [
+                    CircleAvatar(
+                      radius: 60,
+                      backgroundImage: userData['profileImage'] != null ? NetworkImage(userData['profileImage']) : null,
+                      child: userData['profileImage'] == null ? const Icon(Icons.person, size: 60) : null,
+                    ),
+                    if (_isLoading)
+                      const Positioned.fill(child: Center(child: CircularProgressIndicator())),
+                    Positioned(
+                      bottom: 0,
+                      right: 0,
+                      child: InkWell(
+                        onTap: _pickImage,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: const BoxDecoration(color: Color(0xFF228B22), shape: BoxShape.circle),
+                          child: const Icon(Icons.camera_alt, color: Colors.white, size: 20),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Text(userData['name'] ?? 'User', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Text(AuthService.userType ?? 'Resident', style: TextStyle(color: Colors.grey[600])),
+                const Divider(height: 40),
+                _buildInfoRow('Mobile', userData['mobile'] ?? 'N/A'),
+                _buildInfoRow('Email', userData['email'] ?? 'N/A'),
+                _buildInfoRow('Address', userData['address'] ?? 'N/A'),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          SizedBox(width: 100, child: Text(label, style: const TextStyle(fontWeight: FontWeight.bold))),
+          Expanded(child: Text(value)),
+        ],
+      ),
+    );
+  }
+}
+
+class EmergencyContactsPage extends StatelessWidget {
+  const EmergencyContactsPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final contacts = [
+      {'name': 'Barangay Hall', 'number': '123-4567'},
+      {'name': 'Police', 'number': '911'},
+      {'name': 'Fire Department', 'number': '123-4568'},
+      {'name': 'Medical Emergency', 'number': '123-4569'},
+    ];
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Emergency Contacts')),
+      body: ListView.builder(
+        padding: const EdgeInsets.all(16),
+        itemCount: contacts.length,
+        itemBuilder: (context, index) {
+          return Card(
+            child: ListTile(
+              leading: const Icon(Icons.phone, color: Colors.red),
+              title: Text(contacts[index]['name']!),
+              subtitle: Text(contacts[index]['number']!),
+              trailing: IconButton(
+                icon: const Icon(Icons.call, color: Color(0xFF228B22)),
+                onPressed: () {
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Calling ${contacts[index]['name']}')));
+                },
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class TransparencyPage extends StatelessWidget {
+  const TransparencyPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final isOfficial = AuthService.userType == 'Barangay Official';
+    final barangay = AuthService.currentUserData?['barangay'] as String? ?? '';
+
+    Future<String?> _uploadFile() async {
+      try {
+        final result = await FilePicker.platform.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: ['doc', 'docx', 'xls', 'xlsx', 'pdf'],
+        );
+        if (result == null || result.files.isEmpty) return null;
+        final picked = result.files.single;
+        final fileName = picked.name;
+        final ext = (picked.extension ?? '').toLowerCase();
+
+        final fileBytes = picked.bytes;
+        final path = picked.path;
+
+        final length = fileBytes?.lengthInBytes ?? (path != null ? File(path).lengthSync() : 0);
+        if (length > MAX_TRANSPARENCY_UPLOAD_BYTES) {
+          return Future.error('File exceeds maximum allowed size');
+        }
+
+        final storageRef = FirebaseStorage.instance.ref().child('transparency/${barangay.isNotEmpty ? barangay : 'general'}/${DateTime.now().millisecondsSinceEpoch}_$fileName');
+        UploadTask uploadTask;
+        final metadata = SettableMetadata(contentType: _contentTypeFromExt(ext));
+        if (fileBytes != null) {
+          uploadTask = storageRef.putData(fileBytes, metadata);
+        } else if (path != null) {
+          uploadTask = storageRef.putFile(File(path), metadata);
+        } else {
+          return Future.error('Could not read selected file');
+        }
+
+        final snap = await uploadTask;
+        final url = await snap.ref.getDownloadURL();
+
+        await FirebaseFirestore.instance.collection('transparency_docs').add({
+          'title': fileName,
+          'type': ext.toUpperCase(),
+          'url': url,
+          'barangay': barangay,
+          'timestamp': FieldValue.serverTimestamp(),
+        });
+
+        return url;
+      } catch (e) {
+        debugLog('[Transparency] Upload error: $e');
+        rethrow;
+      }
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            const Icon(Icons.article, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text('${barangay.isNotEmpty ? barangay : 'Barangay'} — Transparency Documents', overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white))),
+          ],
+        ),
+      ),
+      floatingActionButton: isOfficial
+          ? FloatingActionButton(
+              onPressed: () async {
+                try {
+                  final res = await _uploadFile();
+                  if (res != null && context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('File uploaded')));
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Upload failed: ${e.toString()}')));
+                  }
+                }
+              },
+              child: const Icon(Icons.upload_file),
+            )
+          : null,
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('transparency_docs')
+            .where('barangay', isEqualTo: barangay)
+            .orderBy('timestamp', descending: true)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+          if (snapshot.hasError) {
+            debugLog('Error loading transparency docs: ${snapshot.error}');
+            return Center(child: Text('Error: ${snapshot.error.toString().replaceFirst('Exception: ', '')}'));
+          }
+          final docs = snapshot.data?.docs ?? [];
+          if (docs.isEmpty) return const Center(child: Text('No documents yet'));
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: docs.length,
+            itemBuilder: (context, index) {
+              final doc = docs[index];
+              final data = doc.data() as Map<String, dynamic>;
+              final ts = data['timestamp'] as Timestamp?;
+              final dateStr = ts != null ? ts.toDate().toString().split(' ').first : 'Unknown';
+              final title = data['title'] as String? ?? 'Untitled';
+              final type = (data['type'] as String?)?.toLowerCase() ?? '';
+              final url = data['url'] as String?;
+
+              Widget leadingPreview;
+              final imageExts = ['png', 'jpg', 'jpeg', 'gif'];
+              if (url != null && imageExts.contains(type)) {
+                leadingPreview = SizedBox(width: 60, height: 60, child: Image.network(url, fit: BoxFit.cover));
+              } else {
+                leadingPreview = Container(
+                  width: 60,
+                  height: 60,
+                  color: Colors.grey[850],
+                  alignment: Alignment.center,
+                  child: const Padding(
+                    padding: EdgeInsets.all(6.0),
+                    child: Text('Preview not available.', style: TextStyle(color: Colors.white, fontSize: 10), textAlign: TextAlign.center),
+                  ),
+                );
+              }
+
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: ListTile(
+                  leading: leadingPreview,
+                  title: Text(title),
+                  subtitle: Text('${(data['type'] ?? 'FILE').toString().toUpperCase()} • $dateStr'),
+                  onTap: () async {
+                    if (url != null) {
+                      final uri = Uri.tryParse(url);
+                      if (uri != null && await canLaunchUrl(uri)) {
+                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                      } else if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Cannot open file')));
+                      }
+                    }
+                  },
+                  trailing: IconButton(
+                    icon: const Icon(Icons.open_in_new),
+                    onPressed: () async {
+                      if (url != null) {
+                        final uri = Uri.tryParse(url);
+                        if (uri != null && await canLaunchUrl(uri)) {
+                          await launchUrl(uri, mode: LaunchMode.externalApplication);
+                        } else if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Cannot open file')));
+                        }
+                      }
+                    },
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  String? _contentTypeFromExt(String ext) {
+    switch (ext) {
+      case 'pdf':
+        return 'application/pdf';
+      case 'doc':
+      case 'docx':
+        return 'application/msword';
+      case 'xls':
+      case 'xlsx':
+        return 'application/vnd.ms-excel';
+      case 'png':
+        return 'image/png';
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      default:
+        return 'application/octet-stream';
+    }
+  }
+}
+
+// ==================== OFFICIAL / ADMIN PAGES ====================
+
+class PendingRequestsPage extends StatelessWidget {
+  const PendingRequestsPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    if (kUseMockData) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Pending Requests (Mock)')),
+        body: ListView.builder(
+          padding: const EdgeInsets.all(16),
+          itemCount: kMockPendingRequests.length,
+          itemBuilder: (context, index) {
+            var doc = kMockPendingRequests[index];
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: ListTile(
+                title: Text(doc['subject'] ?? 'Request'),
+                subtitle: Text(doc['description'] ?? ''),
+                trailing: Text(doc['status'] ?? 'Pending'),
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    final userData = AuthService.currentUserData;
+    final officialBarangay = userData?['barangay'] as String? ?? '';
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Pending Requests')),
+      body: _buildAggregatedRequestsStream(officialBarangay),
+    );
+  }
+
+  // Helper method to aggregate requests from both user subcollections and top-level collection
+  Widget _buildAggregatedRequestsStream(String officialBarangay) {
+    return StreamBuilder<List<QueryDocumentSnapshot>>(
+      stream: _getAggregatedRequestsStream(officialBarangay),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError) {
+          debugLog('Error loading requests: ${snapshot.error}');
+          return Center(child: Text('Error: ${snapshot.error.toString().replaceFirst('Exception: ', '')}'));
+        }
+        
+        final docs = snapshot.data ?? [];
+        if (docs.isEmpty) {
+          return const Center(child: Text('No pending requests for your barangay'));
+        }
+
+        return ListView.builder(
+          padding: const EdgeInsets.all(16),
+          itemCount: docs.length,
+          itemBuilder: (context, index) {
+            var doc = docs[index];
+            final data = doc.data() as Map<String, dynamic>;
+            final userName = data['userName'] as String? ?? 'N/A';
+            final timestamp = data['timestamp'] as Timestamp?;
+            final formattedDate = timestamp != null 
+              ? '${timestamp.toDate().day}/${timestamp.toDate().month}/${timestamp.toDate().year}'
+              : 'N/A';
+            
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: ListTile(
+                title: Text(data['subject'] ?? 'Request'),
+                subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SizedBox(height: 4),
+                    Text('From: $userName', style: const TextStyle(fontSize: 12)),
+                    Text('Reason: ${data['reason'] ?? ''}', style: const TextStyle(fontSize: 12)),
+                    Text('Submitted: $formattedDate', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                    if (data['barangay'] != null && data['barangay'].isNotEmpty)
+                      Text('Barangay: ${data['barangay']}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.green)),
+                  ],
+                ),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (val) async {
+                    try {
+                      if (val == 'Approve') {
+                        await doc.reference.update({'approval': 'Approved', 'status': 'Approved'});
+                        final userId = data['userId'] as String?;
+                        if (userId != null) {
+                          await NotificationService.addNotification(userId, 'Request Approved', 'Your ${data['subject']} request has been approved');
+                        }
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request approved and notification sent')));
+                        }
+                      } else if (val == 'Reject') {
+                        await doc.reference.update({'approval': 'Rejected', 'status': 'Rejected'});
+                        final userId = data['userId'] as String?;
+                        if (userId != null) {
+                          await NotificationService.addNotification(userId, 'Request Rejected', 'Your ${data['subject']} request was rejected');
+                        }
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request rejected and notification sent')));
+                        }
+                      }
+                    } catch (e) {
+                      debugLog('Error updating request: $e');
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: ${e.toString()}')));
+                      }
+                    }
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'Approve', child: Text('Approve')),
+                    PopupMenuItem(value: 'Reject', child: Text('Reject')),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // Stream aggregation helper: combines user subcollections and top-level collection
+  Stream<List<QueryDocumentSnapshot>> _getAggregatedRequestsStream(String officialBarangay) {
+    try {
+      // Query both sources
+      final userSubcollectionStream = FirebaseFirestore.instance
+        .collectionGroup('requests')
+        .where('barangay', isEqualTo: officialBarangay)
+        .where('approval', isEqualTo: 'Pending')
+        .snapshots();
+
+      final topLevelStream = FirebaseFirestore.instance
+        .collection('requests')
+        .where('barangay', isEqualTo: officialBarangay)
+        .where('approval', isEqualTo: 'Pending')
+        .snapshots();
+
+      // Combine streams using mergeAsyncStreams-like behavior
+      return CombineLatestStream.combine2(userSubcollectionStream, topLevelStream, (userDocs, topDocs) {
+        final allDocs = <QueryDocumentSnapshot>[...userDocs.docs, ...topDocs.docs];
+        
+        // Deduplicate by combining userId, subject, and timestamp as unique key
+        final seen = <String>{};
+        final deduped = <QueryDocumentSnapshot>[];
+        
+        for (final doc in allDocs) {
+          final data = doc.data() as Map<String, dynamic>;
+          final key = '${data['userId'] ?? ''}_${data['subject'] ?? ''}_${data['timestamp'] ?? ''}';
+          if (!seen.contains(key)) {
+            seen.add(key);
+            deduped.add(doc);
+          }
+        }
+        
+        // Sort by timestamp descending
+        deduped.sort((a, b) {
+          final aTime = (a.data() as Map<String, dynamic>)['timestamp'] as Timestamp?;
+          final bTime = (b.data() as Map<String, dynamic>)['timestamp'] as Timestamp?;
+          if (aTime == null || bTime == null) return 0;
+          return bTime.compareTo(aTime);
+        });
+        
+        return deduped;
+      });
+    } catch (e) {
+      debugLog('[RequestsStream] Error creating aggregated stream: $e');
+      return Stream.value([]);
+    }
+  }
+}
+
+class ResidentsDirectoryPage extends StatelessWidget {
+  const ResidentsDirectoryPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    if (kUseMockData) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Residents Directory (Mock)')),
+        body: ListView.builder(
+          padding: const EdgeInsets.all(16),
+          itemCount: kMockResidents.length,
+          itemBuilder: (context, index) {
+            var user = kMockResidents[index];
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: ListTile(
+                leading: CircleAvatar(child: const Icon(Icons.person)),
+                title: Text(user['name'] ?? 'Resident'),
+                subtitle: Text(user['mobile'] ?? ''),
+                onTap: () {
+                  showDialog(context: context, builder: (_) => AlertDialog(
+                    title: Text(user['name'] ?? 'Resident'),
+                    content: Column(mainAxisSize: MainAxisSize.min, children: [Text('Email: ${user['email'] ?? 'N/A'}'), Text('Mobile: ${user['mobile'] ?? 'N/A'}'), Text('Address: ${user['address'] ?? 'N/A'}')]),
+                    actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+                  ));
+                },
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Residents Directory')),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection('users').where('type', isEqualTo: 'Resident').orderBy('name').snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+          if (snapshot.data!.docs.isEmpty) return const Center(child: Text('No residents found'));
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: snapshot.data!.docs.length,
+            itemBuilder: (context, index) {
+              var user = snapshot.data!.docs[index];
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: ListTile(
+                  leading: CircleAvatar(
+                    backgroundImage: user['profileImage'] != null ? NetworkImage(user['profileImage']) : null,
+                    child: user['profileImage'] == null ? const Icon(Icons.person) : null,
+                  ),
+                  title: Text(user['name'] ?? 'Resident'),
+                  subtitle: Text(user['mobile'] ?? ''),
+                  onTap: () {
+                    showDialog(context: context, builder: (_) => AlertDialog(
+                      title: Text(user['name'] ?? 'Resident'),
+                      content: Column(mainAxisSize: MainAxisSize.min, children: [Text('Email: ${user['email'] ?? 'N/A'}'), Text('Mobile: ${user['mobile'] ?? 'N/A'}'), Text('Address: ${user['address'] ?? 'N/A'}')]),
+                      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+                    ));
+                  },
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class PostAnnouncementPage extends StatefulWidget {
+  const PostAnnouncementPage({Key? key}) : super(key: key);
+
+  @override
+  State<PostAnnouncementPage> createState() => _PostAnnouncementPageState();
+}
+
+class _PostAnnouncementPageState extends State<PostAnnouncementPage> {
+  final _titleController = TextEditingController();
+  final _contentController = TextEditingController();
+  bool _isLoading = false;
+  File? _pickedImage;
+  final ImagePicker _picker = ImagePicker();
+
+  Future<void> _post() async {
+    if (_titleController.text.trim().isEmpty || _contentController.text.trim().isEmpty) return;
+    setState(() => _isLoading = true);
+    String? imageUrl;
+    if (_pickedImage != null) {
+      imageUrl = await AuthService.uploadImage(_pickedImage!, 'announcements/${DateTime.now().millisecondsSinceEpoch}.jpg');
+    }
+
+    await FirebaseFirestore.instance.collection('announcements').add({
+      'title': _titleController.text.trim(),
+      'content': _contentController.text.trim(),
+      'imageUrl': imageUrl,
+      'barangay': AuthService.currentUserData?['barangay'] as String? ?? '',
+      'timestamp': FieldValue.serverTimestamp(),
+    });
+    setState(() => _isLoading = false);
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Announcement posted')));
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Post Announcement')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            TextField(controller: _titleController, decoration: const InputDecoration(labelText: 'Title')),
+            const SizedBox(height: 12),
+            TextField(controller: _contentController, decoration: const InputDecoration(labelText: 'Content'), maxLines: 6),
+            const SizedBox(height: 12),
+            if (_pickedImage != null)
+              Container(height: 160, width: double.infinity, decoration: BoxDecoration(borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.grey)), child: Image.file(_pickedImage!, fit: BoxFit.cover)),
+            const SizedBox(height: 8),
+            Row(children: [
+              ElevatedButton.icon(onPressed: () async { final XFile? f = await _picker.pickImage(source: ImageSource.gallery); if (f != null) setState(() => _pickedImage = File(f.path)); }, icon: const Icon(Icons.photo), label: const Text('Add Photo')),
+              const SizedBox(width: 12),
+              if (_pickedImage != null) TextButton(onPressed: () => setState(() => _pickedImage = null), child: const Text('Remove')),
+            ]),
+            const SizedBox(height: 20),
+            _isLoading ? const CircularProgressIndicator() : ElevatedButton(onPressed: _post, child: const Text('POST')),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ViewComplaintsAdminPage extends StatelessWidget {
+  const ViewComplaintsAdminPage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('View Complaints')),
+      body: kUseMockData
+          ? ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: kMockComplaints.length,
+              itemBuilder: (context, index) {
+                final doc = kMockComplaints[index];
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  child: ListTile(
+                    title: Text(doc['subject'] ?? 'Complaint'),
+                    subtitle: Text(doc['description'] ?? ''),
+                    trailing: Text(doc['status'] ?? 'Pending'),
+                    onTap: () {
+                      showModalBottomSheet(context: context, builder: (_) {
+                        return Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(mainAxisSize: MainAxisSize.min, children: [
+                            Text('Change status for: ${doc['subject'] ?? ''}'),
+                            const SizedBox(height: 12),
+                            Row(children: [
+                              ElevatedButton(onPressed: () {
+                                // In mock mode we just update local list (not persisted)
+                                doc['status'] = 'In Progress';
+                                if (context.mounted) Navigator.pop(context);
+                              }, child: const Text('In Progress')),
+                              const SizedBox(width: 8),
+                              ElevatedButton(onPressed: () {
+                                doc['status'] = 'Resolved';
+                                if (context.mounted) Navigator.pop(context);
+                              }, child: const Text('Resolve')),
+                            ])
+                          ]),
+                        );
+                      });
+                    },
+                  ),
+                );
+              },
+            )
+          : StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                .collection('complaints')
+                .where('barangay', isEqualTo: AuthService.currentUserData?['barangay'] as String? ?? '')
+                .orderBy('timestamp', descending: true)
+                .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+                if (snapshot.hasError) {
+                  debugLog('Error loading complaints: ${snapshot.error}');
+                  return Center(child: Text('Error: ${snapshot.error.toString().replaceFirst('Exception: ', '')}'));
+                }
+                if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const Center(child: Text('No complaints yet'));
+
+                return ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: snapshot.data!.docs.length,
+                  itemBuilder: (context, index) {
+                    var doc = snapshot.data!.docs[index];
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      child: ListTile(
+                        title: Text(doc['subject'] ?? 'Complaint'),
+                        subtitle: Text(doc['description'] ?? ''),
+                        trailing: Text(doc['status'] ?? 'Pending'),
+                        onTap: () {
+                          showModalBottomSheet(context: context, builder: (_) {
+                            return Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                Text('Change status for: ${doc['subject'] ?? ''}'),
+                                const SizedBox(height: 12),
+                                Row(children: [
+                                  ElevatedButton(onPressed: () async { await doc.reference.update({'status': 'In Progress'}); if (context.mounted) Navigator.pop(context); }, child: const Text('In Progress')),
+                                  const SizedBox(width: 8),
+                                  ElevatedButton(onPressed: () async { await doc.reference.update({'status': 'Resolved'}); if (context.mounted) Navigator.pop(context); }, child: const Text('Resolve')),
+                                ])
+                              ]),
+                            );
+                          });
+                        },
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+    );
+  }
+}
+
+class StatisticsPage extends StatelessWidget {
+  const StatisticsPage({Key? key}) : super(key: key);
+
+  Future<int> _countCollection(String path, [Query? query]) async {
+    if (kUseMockData) {
+      // Return quick mock counts for the UI when using mock data
+      if (path == 'users') return kMockResidents.length;
+      if (path == 'complaints') return kMockComplaints.length;
+      if (path == 'announcements') return 2; // small mock
+      return 0;
+    }
+
+    final snap = await (query ?? FirebaseFirestore.instance.collection(path)).get();
+    return snap.size;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Statistics')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            FutureBuilder<int>(
+              future: _countCollection('users', FirebaseFirestore.instance.collection('users').where('type', isEqualTo: 'Resident')),
+              builder: (context, snap) => ListTile(title: const Text('Total Residents'), subtitle: Text('${snap.data ?? 0}')),
+            ),
+            FutureBuilder<int>(
+              future: _countCollection('complaints'),
+              builder: (context, snap) => ListTile(title: const Text('Total Complaints'), subtitle: Text('${snap.data ?? 0}')),
+            ),
+            FutureBuilder<int>(
+              future: _countCollection('announcements'),
+              builder: (context, snap) => ListTile(title: const Text('Total Announcements'), subtitle: Text('${snap.data ?? 0}')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

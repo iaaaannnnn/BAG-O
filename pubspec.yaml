@@ -1,0 +1,50 @@
+name: bago_system
+description: BAGO (Barangay Automated Governance and Operation) - A comprehensive platform for barangay services and notifications.
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=2.19.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.2
+  image_picker: ^1.0.4
+  file_picker: ^8.0.0
+  file_selector: ^1.1.0
+  firebase_core: ^4.2.1
+  firebase_auth: ^6.1.2
+  cloud_firestore: ^6.1.0
+  firebase_storage: ^13.0.4
+  url_launcher: ^6.1.10
+  rxdart: ^0.28.0
+  fl_chart: ^0.69.0
+  pdfx: ^2.7.0
+  flutter_inappwebview: ^6.0.0
+  csv: ^6.0.0
+  flutter_image_compress: ^2.3.0
+  google_fonts: ^6.2.1
+  shared_preferences: ^2.3.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/images/FINAL_LOGO_NAT_-removebg-preview.png
+    - assets/data/region8/
+
+# Configuration for flutter_launcher_icons
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/FINAL_LOGO_NAT_-removebg-preview.png"
+  remove_alpha_ios: true

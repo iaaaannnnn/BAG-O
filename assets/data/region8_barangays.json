@@ -1,0 +1,27 @@
+{
+  "BILIRAN": {
+    "ALMERIA": ["Caucab", "Iyosan", "Jamorawon", "Lo-ok", "Matanga", "Pili", "Poblacion"],
+    "BILIRAN": ["Bato", "Burabod", "Busali", "Canila", "Hugpa", "Julita"],
+    "CABUCGAYAN": ["Balaquid", "Baso", "Bunga", "Caanibongan", "Casiawan", "Esperanza"]
+  },
+  "EASTERN SAMAR": {
+    "BORONGAN": ["Baybay", "Cabatangan", "Cabalawan", "Cagudman", "Hibuson"],
+    "GUIUAN": ["Balangiga", "Balangkayan", "Balijao", "Baluran", "Cagta"]
+  },
+  "LEYTE": {
+    "ABUYOG": ["Aguiting", "Anahawan", "Anilao", "Bonifacio", "Bugnay"],
+    "ALANGALANG": ["Balatong", "Bayabas", "Bongbong", "Bugallon", "Cahaguak"]
+  },
+  "SOUTHERN LEYTE": {
+    "SAN RICARDO": ["Barangay 1", "Barangay 2", "Barangay 3"],
+    "SILAGO": ["Barangay A", "Barangay B", "Barangay C"]
+  },
+  "SAMAR": {
+    "CALBAYOG": ["Barangay 1", "Barangay 2", "Barangay 3"],
+    "GANDARA": ["Barangay 4", "Barangay 5", "Barangay 6"]
+  },
+  "NORTHERN SAMAR": {
+    "ALLEN": ["Barangay I", "Barangay II", "Barangay III"],
+    "BIRI": ["Barangay IV", "Barangay V", "Barangay VI"]
+  }
+}

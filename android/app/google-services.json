@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "885906739357",
+    "project_id": "barangay-system-d67b0",
+    "storage_bucket": "barangay-system-d67b0.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:885906739357:android:48072009155806fa1f8474",
+        "android_client_info": {
+          "package_name": "com.example.bago"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBGQKvbvLowSnwPyX0e1xFYhsNCRQePIb0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,41 @@
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAdmin() {
+      return request.auth != null && request.auth.token.isAdmin == true;
+    }
+
+    // Allow read access to authenticated users generally
+    match /{allPaths=**} {
+      allow read: if request.auth != null;
+    }
+
+    // Transparency uploads organized by barangay: /transparency_docs/{barangay}/... 
+    // Note: Storage security rules cannot read Firestore documents. For per-barangay
+    // enforcement we rely on a custom claim `barangay` present in the user's token.
+    // If you do not use custom claims, consider permitting writes only for admins,
+    // or set claims via Admin SDK on sign-up.
+    match /transparency_docs/{barangay}/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && (isAdmin() || (request.auth.token.barangay != null && request.auth.token.barangay == barangay));
+    }
+    
+    // Complaints images - any authenticated user can upload
+    match /complaints/{imageFile} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+    
+    // Profile images - any authenticated user can upload their own
+    match /profiles/{imageFile} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+    
+    // Announcements images - barangay officials can upload
+    match /announcements/{imageFile} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+  }
+}

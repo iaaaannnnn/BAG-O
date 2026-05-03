@@ -1,0 +1,52 @@
+﻿import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:rxdart/rxdart.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../document_viewer.dart';
+import '../ui_constants.dart';
+
+part 'app_router.dart';
+part 'app_theme.dart';
+part '../core/constants.dart';
+part '../core/services/auth_service.dart';
+part '../core/services/notification_service.dart';
+part '../core/utils/image_and_guest_helpers.dart';
+part '../core/utils/media_helpers.dart';
+part '../core/widgets/app_widgets.dart';
+part '../core/widgets/circular_profile_icon.dart';
+part 'app_shell.dart';
+part '../features/auth/login_page.dart';
+part '../features/auth/register_page.dart';
+part '../features/resident/resident_dashboard.dart';
+part '../features/official/approval_panel_page.dart';
+part '../features/official/official_dashboard.dart';
+part '../features/notifications/notifications_page.dart';
+part '../features/documents/request_documents_page.dart';
+part '../features/announcements/announcements_page.dart';
+part '../features/complaints/file_complaint_page.dart';
+part '../features/hotlines/hotlines_pages.dart';
+part '../features/transparency/transparency_page.dart';
+part '../features/documents/pending_requests_page.dart';
+part '../features/documents/my_document_requests_page.dart';
+part '../features/official/residents_directory_page.dart';
+part '../features/profile/profile_page.dart';
+part '../features/announcements/post_announcement_page.dart';
+part '../features/complaints/view_complaints_admin_page.dart';
+part '../features/statistics/statistics_page.dart';
+part '../features/documents/manage_document_types_page.dart';
+

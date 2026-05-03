@@ -1,0 +1,260 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return request.auth != null && request.auth.token.get('isAdmin', false) == true;
+    }
+
+    function isCurrentUserOfficialProfile() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.type == 'Barangay Official'
+          || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.type == 'Barangay_Official'
+          || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'Barangay Official'
+          || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'Barangay_Official'
+        );
+    }
+
+    function isBarangayOfficial() {
+      return request.auth != null && (
+        request.auth.token.get('role', '') == 'Barangay Official'
+        || request.auth.token.get('role', '') == 'Barangay_Official'
+        || isCurrentUserOfficialProfile()
+      );
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Users collection - Allow authenticated reads to support queries
+    // Note: Queries with where clauses still need proper rules
+    match /users/{userId} {
+      // Read: any authenticated user can read user profiles
+      // This allows querying users by barangay for directories, etc.
+      allow read: if isAuthenticated();
+      
+      // Allow user creation during registration (when user is being created, they match the userId)
+      allow create: if request.auth != null && request.auth.uid == userId;
+      
+      // Owners may update their own profile but cannot change sensitive fields
+      // Allow updating profile image fields and expirationDate for guest residents
+      allow update: if isOwner(userId)
+        && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['isAdmin', 'barangay', 'status', 'role', 'type', 'email', 'mobile'])
+        && (
+          // Allow expirationDate and profile updates for guest residents
+          (resource.data.type == 'Guest Resident' && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expirationDate', 'lastRenewalDate', 'profileImageUrl', 'profileImageUpdatedAt']))
+          // Or regular profile updates for non-guests
+          || resource.data.type != 'Guest Resident'
+        );
+      
+      // Admins can do anything
+      allow update: if isAdmin();
+      
+      // Barangay officials can update limited approval-related fields for user approval workflow
+      allow update: if isBarangayOfficial()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'role', 'approvedAt', 'rejectedAt', 'approval', 'approvalStatus']);
+      
+      allow delete: if isAdmin();
+      
+      // User's document requests subcollection - users can read/write their own requests
+      match /requests/{requestId} {
+        // Owner can read and create their own requests
+        allow read: if isAuthenticated() && request.auth.uid == userId;
+        allow create: if isAuthenticated() && request.auth.uid == userId;
+        // Owner can update limited fields, officials can update all
+        allow update: if isAuthenticated() && (
+          request.auth.uid == userId ||
+          isAdmin() ||
+          isBarangayOfficial()
+        );
+        // Allow delete for: owner (only pending requests), admin, or barangay official
+        allow delete: if isAuthenticated() && (
+          (request.auth.uid == userId && resource.data.get('status', '') == 'Pending') ||
+          isAdmin() ||
+          isBarangayOfficial()
+        );
+      }
+    }
+    
+    // Deleted accounts - track recently deleted accounts for re-registration cooldown
+    match /deleted_accounts/{docId} {
+      // Allow anyone to read (for registration checks before auth)
+      allow read: if true;
+      // Only authenticated users can create (during account deletion)
+      allow create: if isAuthenticated();
+      // Only admins can update/delete
+      allow update, delete: if isAdmin();
+    }
+    
+    // Phone numbers - SECURE duplicate checking
+    match /phone_numbers/{phoneNumber} {
+      // Allow ANYONE to check if specific phone/email exists (for registration verification)
+      // This must be true for unauthenticated users during registration
+      allow get: if true;
+      
+      // Prevent listing/scraping all phone numbers
+      // Only admins can list all
+      allow list: if isAdmin();
+      
+      // Allow writes during registration (both authenticated and unauthenticated)
+      // Document must have a uid field to be a valid entry
+      // This is needed for guest registration to work
+      allow write: if request.resource.data.get('uid', '') != '';
+    }
+    
+    // Announcements
+    match /announcements/{announcementId} {
+      allow read: if isAuthenticated();
+      // Officials can create announcements for their barangay
+      allow create: if isAuthenticated() 
+        && isCurrentUserOfficialProfile()
+        && request.resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay;
+      // Officials can update/delete announcements for their barangay
+      allow update, delete: if isAuthenticated() 
+        && isCurrentUserOfficialProfile()
+        && resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay;
+    }
+    
+    // Document Types - managed by barangay officials, readable by authenticated users
+    match /document_types/{docTypeId} {
+      // Any authenticated user can read document types (to show available documents)
+      allow read: if isAuthenticated();
+      
+      // Only barangay officials can create document types for their barangay
+      // Uses Firestore get() as fallback since custom claims may not be set
+      allow create: if isAuthenticated()
+        && isCurrentUserOfficialProfile()
+        && request.resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay;
+      
+      // Only barangay officials can update/delete document types for their barangay
+      allow update, delete: if isAuthenticated()
+        && isCurrentUserOfficialProfile()
+        && resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay;
+    }
+    
+    // Requests (document requests, certificates, etc.) - including subcollections under users
+    match /requests/{requestId} {
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin() ||
+        (isCurrentUserOfficialProfile()
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay == resource.data.barangay)
+      );
+      allow create: if isAuthenticated() 
+        && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin() ||
+        (isCurrentUserOfficialProfile()
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay == resource.data.barangay)
+      );
+      allow delete: if isAdmin();
+    }
+    
+    // Transparency documents
+    match /transparency_docs/{docId} {
+      // Allow authenticated users to read their barangay's documents
+      allow read: if isAuthenticated();
+      
+      // Allow authenticated users to upload transparency docs
+      // Must have barangay and userId fields
+      allow create: if isAuthenticated() && request.resource.data.get('userId', '') != '' && request.resource.data.get('barangay', '') != '';
+      
+      // Allow barangay officials to update/delete their own uploads
+      allow update, delete: if isAuthenticated() && resource.data.uploadedBy == request.auth.uid;
+    }
+    
+    // Document requests (for document fulfillment system)
+    match /document_requests/{requestId} {
+      // Allow reads for: owner (by userId field), admin, or barangay official in same barangay
+      // Note: For queries with where('userId', isEqualTo: uid), the rule checks if userId matches
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin() ||
+        (isCurrentUserOfficialProfile()
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay == resource.data.barangay)
+      );
+      
+      allow create: if isAuthenticated() 
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.get('barangay', '') != '';
+      
+      // Allow updates for: owner (limited fields), admin, or barangay official in same barangay
+      allow update: if isAuthenticated() && (
+        (resource.data.userId == request.auth.uid && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['userId', 'barangay'])) ||
+        isAdmin() ||
+        (isCurrentUserOfficialProfile()
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay == resource.data.barangay)
+      );
+      
+      // Allow delete for: owner (only pending requests), admin, or barangay official in same barangay
+      allow delete: if isAuthenticated() && (
+        (resource.data.userId == request.auth.uid && resource.data.get('status', '') == 'Pending') ||
+        isAdmin() ||
+        (isCurrentUserOfficialProfile()
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay == resource.data.barangay)
+      );
+    }
+    
+    // Complaints
+    match /complaints/{complaintId} {
+      allow read: if isAuthenticated() 
+        && (
+          resource.data.userId == request.auth.uid ||
+          isAdmin() ||
+          (isCurrentUserOfficialProfile()
+            && resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay)
+        );
+      allow create: if isAuthenticated() 
+        && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() 
+        && (
+          resource.data.userId == request.auth.uid ||
+          isAdmin() ||
+          (isCurrentUserOfficialProfile()
+            && resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay)
+        );
+      // Allow delete for: owner (for resolved complaints auto-cleanup), admin, or barangay officials
+      allow delete: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin() ||
+        (isCurrentUserOfficialProfile()
+          && resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay)
+      );
+    }
+    
+    // Notifications - Allow users to read all notifications (filter at app level)
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated();
+      // Allow any authenticated user to create notifications (officials notify residents)
+      allow create: if isAuthenticated();
+      allow update, delete: if isAuthenticated() 
+        && resource.data.userId == request.auth.uid;
+    }
+    
+    // Hotlines - public emergency contact information
+    match /hotlines/{hotlineId} {
+      // Any authenticated user can read hotlines (residents need to view emergency contacts)
+      allow read: if isAuthenticated();
+      
+      // Only barangay officials can create hotlines for their barangay
+      allow create: if isAuthenticated()
+        && isCurrentUserOfficialProfile()
+        && request.resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay;
+      
+      // Only barangay officials can update/delete hotlines for their barangay
+      allow update, delete: if isAuthenticated()
+        && isCurrentUserOfficialProfile()
+        && resource.data.barangay == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.barangay;
+    }
+  }
+}
