@@ -1,16 +1,91 @@
-# barangay_system
+# BAG-O — Barangay Automated Governance and Operation
 
-A new Flutter project.
+A Flutter + Firebase mobile application that digitizes barangay governance, enabling residents and barangay officials to interact seamlessly through a unified platform.
+
+---
+
+## Features
+
+### For Residents
+- Register and get approved by barangay officials
+- Submit complaints and track their status
+- Request barangay documents (clearance, residency, etc.)
+- View announcements and events
+- Access transparency documents
+- Receive in-app notifications
+
+### For Barangay Officials
+- Approve or reject resident registrations
+- Manage and respond to complaints
+- Post announcements and events
+- Upload transparency/public documents
+- Send notifications to residents
+- View analytics dashboard
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Flutter (Dart) |
+| Backend | Firebase (Firestore, Auth, Storage) |
+| Auth | Firebase Authentication |
+| Database | Cloud Firestore |
+| File Storage | Firebase Storage |
+| Notifications | In-app (Firestore-based) |
+
+---
 
 ## Getting Started
 
-This project is a starting point for a Flutter application.
+### Prerequisites
+- Flutter SDK (3.x or later)
+- Firebase project configured (google-services.json for Android)
+- Android Studio / VS Code
 
-A few resources to get you started if this is your first Flutter project:
+### Setup
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+`ash
+flutter pub get
+flutter analyze
+flutter run -d android
+`
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+### Build Release APK
+
+`ash
+flutter build apk --release
+`
+
+---
+
+## Project Structure
+
+`
+lib/
+  app/              # App root, shell, router, theme
+  core/             # Services (Auth, Notifications), widgets, utils
+  features/
+    auth/           # Login and Registration pages
+    resident/       # Resident dashboard and features
+    official/       # Official dashboard, approval panel
+    announcements/  # Announcements page
+    notifications/  # Notifications page
+    documents/      # Document request page
+    profile/        # User profile page
+`
+
+---
+
+## Firebase Setup
+
+- Place google-services.json in android/app/
+- For iOS, add GoogleService-Info.plist to ios/Runner/
+- Deploy Firestore rules via: npx firebase-tools deploy --only firestore:rules --project YOUR_PROJECT_ID
+
+---
+
+## License
+
+Private — All rights reserved.
